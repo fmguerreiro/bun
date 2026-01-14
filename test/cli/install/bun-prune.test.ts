@@ -392,12 +392,7 @@ describe.concurrent("bun prune", () => {
     expect(existsSync(join(String(dir), "node_modules/lodash"))).toBe(true);
   });
 
-  // TODO: This test is skipped because debug builds don't auto-install workspace package dependencies.
-  // Workspace packages and their dependencies (e.g., packages/pkg1 and its lodash dependency) aren't
-  // installed in node_modules during `bun install` in debug builds, even though the lockfile is correct.
-  // Production builds work correctly. This is a pre-existing installation bug, not a prune issue.
-  // Related: #16162 (transitive deps in workspaces), #19782 (workspace linking on first install)
-  it.skip("should work in workspaces", async () => {
+  it("should preserve workspace package dependencies", async () => {
     using dir = tempDir("prune-workspace", {
       "package.json": JSON.stringify({
         name: "root",
@@ -411,13 +406,9 @@ describe.concurrent("bun prune", () => {
         name: "pkg1",
         version: "1.0.0",
         dependencies: {
-          lodash: "^4.17.0",
+          "is-odd": "^3.0.1",
         },
       }),
-      "bunfig.toml": `
-[install]
-linkWorkspacePackages = true
-`,
     });
 
     await using installProc = Bun.spawn({
@@ -427,15 +418,35 @@ linkWorkspacePackages = true
       stdout: "pipe",
       stderr: "pipe",
     });
-    expect(await installProc.exited).toBe(0);
+
+    const [installStdout, installStderr, installExitCode] = await Promise.all([
+      installProc.stdout.text(),
+      installProc.stderr.text(),
+      installProc.exited,
+    ]);
+
+    expect(installExitCode).toBe(0);
+
+    // Check what packages are installed - is-odd depends on is-number
+    // So we should have: is-number (root dep), is-odd (workspace dep), pkg1 (workspace symlink)
+    const rootNodeModules = join(String(dir), "node_modules");
+
+    // Verify is-number is installed (root dependency)
+    expect(existsSync(join(rootNodeModules, "is-number"))).toBe(true);
+
+    // Verify is-odd is installed (workspace pkg1 dependency)
+    // This may be in root node_modules (hoisted) or in pkg1/node_modules
+    const isOddInRoot = existsSync(join(rootNodeModules, "is-odd"));
+    const isOddInWorkspace = existsSync(join(String(dir), "packages/pkg1/node_modules/is-odd"));
+    expect(isOddInRoot || isOddInWorkspace).toBe(true);
 
     // Manually create a stray package directory that's not in lockfile
-    const strayPkgPath = join(String(dir), "node_modules/typescript");
+    const strayPkgPath = join(rootNodeModules, "typescript");
     mkdirSync(strayPkgPath, { recursive: true });
     writeFileSync(join(strayPkgPath, "package.json"), JSON.stringify({ name: "typescript", version: "5.0.0" }));
     writeFileSync(join(strayPkgPath, "index.js"), "module.exports = {};");
 
-    // Run prune
+    // Run prune (non-production mode)
     await using pruneProc = Bun.spawn({
       cmd: [bunExe(), "prune"],
       cwd: String(dir),
@@ -453,11 +464,95 @@ linkWorkspacePackages = true
     expect(exitCode).toBe(0);
     expect(stderr).not.toContain("error:");
 
-    // Verify workspace packages still exist
-    expect(existsSync(join(String(dir), "node_modules/pkg1"))).toBe(true);
+    // CRITICAL: Workspace package dependencies must be preserved
+    // is-odd is a dependency of pkg1 (workspace package) and must NOT be removed
+    const isOddStillInRoot = existsSync(join(rootNodeModules, "is-odd"));
+    const isOddStillInWorkspace = existsSync(join(String(dir), "packages/pkg1/node_modules/is-odd"));
+    expect(isOddStillInRoot || isOddStillInWorkspace).toBe(true);
 
-    // Verify workspace dependency still exists
-    expect(existsSync(join(String(dir), "node_modules/lodash"))).toBe(true);
+    // Root dependency must also be preserved
+    expect(existsSync(join(rootNodeModules, "is-number"))).toBe(true);
+
+    // Stray package must be removed
+    expect(existsSync(strayPkgPath)).toBe(false);
+  });
+
+  it("should preserve workspace package dependencies in production mode", async () => {
+    using dir = tempDir("prune-workspace-prod", {
+      "package.json": JSON.stringify({
+        name: "root",
+        version: "1.0.0",
+        workspaces: ["packages/*"],
+        dependencies: {
+          "is-number": "^7.0.0",
+        },
+        devDependencies: {
+          typescript: "^5.0.0",
+        },
+      }),
+      "packages/pkg1/package.json": JSON.stringify({
+        name: "pkg1",
+        version: "1.0.0",
+        dependencies: {
+          "is-odd": "^3.0.1",
+        },
+        devDependencies: {
+          "is-even": "^1.0.0",
+        },
+      }),
+    });
+
+    await using installProc = Bun.spawn({
+      cmd: [bunExe(), "install"],
+      cwd: String(dir),
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await installProc.exited).toBe(0);
+
+    const rootNodeModules = join(String(dir), "node_modules");
+
+    // Verify production dependencies are installed
+    expect(existsSync(join(rootNodeModules, "is-number"))).toBe(true);
+
+    // Verify dev dependencies are installed
+    expect(existsSync(join(rootNodeModules, "typescript"))).toBe(true);
+
+    // Verify workspace production dependency is installed (is-odd may be hoisted)
+    const isOddInRoot = existsSync(join(rootNodeModules, "is-odd"));
+    const isOddInWorkspace = existsSync(join(String(dir), "packages/pkg1/node_modules/is-odd"));
+    expect(isOddInRoot || isOddInWorkspace).toBe(true);
+
+    // Run prune with --production
+    await using pruneProc = Bun.spawn({
+      cmd: [bunExe(), "prune", "--production"],
+      cwd: String(dir),
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      pruneProc.stdout.text(),
+      pruneProc.stderr.text(),
+      pruneProc.exited,
+    ]);
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("error:");
+
+    // CRITICAL: Workspace package PRODUCTION dependencies must be preserved
+    // is-odd is a production dependency of pkg1 and must NOT be removed
+    const isOddStillInRoot = existsSync(join(rootNodeModules, "is-odd"));
+    const isOddStillInWorkspace = existsSync(join(String(dir), "packages/pkg1/node_modules/is-odd"));
+    expect(isOddStillInRoot || isOddStillInWorkspace).toBe(true);
+
+    // Root production dependency must also be preserved
+    expect(existsSync(join(rootNodeModules, "is-number"))).toBe(true);
+
+    // Dev dependencies should be removed
+    expect(existsSync(join(rootNodeModules, "typescript"))).toBe(false);
   });
 
   it("should handle nested dependencies correctly", async () => {

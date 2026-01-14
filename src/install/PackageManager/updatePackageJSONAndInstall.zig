@@ -509,53 +509,58 @@ fn updatePackageJSONAndInstallWithManagerWithUpdates(
             production_reachable_ids = try bun.bit_set.DynamicBitSetUnmanaged.initEmpty(manager.allocator, packages.len);
             var reachable = &production_reachable_ids.?;
 
-            const root_pkg_id = manager.root_package_id.get(manager.lockfile, manager.workspace_name_hash);
+            const dependencies_lists = packages.items(.dependencies);
+            const resolutions_lists = packages.items(.resolutions);
 
-            if (root_pkg_id == invalid_package_id) {
-                production_reachable_ids = null;
-            } else {
-                const dependencies_lists = packages.items(.dependencies);
-                const resolutions_lists = packages.items(.resolutions);
+            var queue: std.ArrayListUnmanaged(PackageID) = .{};
+            defer queue.deinit(manager.allocator);
+            var visited = std.AutoHashMap(PackageID, void).init(manager.allocator);
+            defer visited.deinit();
 
-                var queue: std.ArrayListUnmanaged(PackageID) = .{};
-                defer queue.deinit(manager.allocator);
-                var visited = std.AutoHashMap(PackageID, void).init(manager.allocator);
-                defer visited.deinit();
+            // Seed BFS with production dependencies from root package AND all workspace packages
+            // This ensures workspace package dependencies are properly marked as reachable
+            for (package_resolutions, 0..) |res, idx| {
+                const pkg_id = @as(PackageID, @intCast(idx));
+                // Process root package (ID 0) and all workspace packages
+                if (pkg_id != 0 and res.tag != .workspace) continue;
 
-                const root_dep_list = dependencies_lists[root_pkg_id];
-                const root_res_list = resolutions_lists[root_pkg_id];
-                const root_deps = root_dep_list.get(manager.lockfile.buffers.dependencies.items);
-                const root_package_ids = root_res_list.get(manager.lockfile.buffers.resolutions.items);
+                const dep_list = dependencies_lists[pkg_id];
+                const res_list = resolutions_lists[pkg_id];
+                const deps = dep_list.get(manager.lockfile.buffers.dependencies.items);
+                const dep_pkg_ids = res_list.get(manager.lockfile.buffers.resolutions.items);
 
-                for (root_deps, root_package_ids) |dep, pkg_id| {
-                    if (pkg_id != invalid_package_id and pkg_id < packages.len and !dep.behavior.dev) {
-                        try queue.append(manager.allocator, pkg_id);
-                        try visited.put(pkg_id, {});
-                        reachable.set(pkg_id);
-                    }
+                for (deps, dep_pkg_ids) |dep, dep_pkg_id| {
+                    if (dep_pkg_id == invalid_package_id) continue;
+                    if (dep_pkg_id >= packages.len) continue;
+                    if (dep.behavior.dev) continue;
+                    if (visited.contains(dep_pkg_id)) continue;
+
+                    try queue.append(manager.allocator, dep_pkg_id);
+                    try visited.put(dep_pkg_id, {});
+                    reachable.set(dep_pkg_id);
                 }
+            }
 
-                // BFS traversal of transitive dependencies
-                var qi: usize = 0;
-                while (qi < queue.items.len) : (qi += 1) {
-                    const current_pkg_id = queue.items[qi];
-                    if (current_pkg_id >= dependencies_lists.len) continue;
+            // BFS traversal of transitive dependencies
+            var qi: usize = 0;
+            while (qi < queue.items.len) : (qi += 1) {
+                const current_pkg_id = queue.items[qi];
+                if (current_pkg_id >= dependencies_lists.len) continue;
 
-                    const dep_list = dependencies_lists[current_pkg_id];
-                    const res_list = resolutions_lists[current_pkg_id];
-                    const deps = dep_list.get(manager.lockfile.buffers.dependencies.items);
-                    const pkg_ids = res_list.get(manager.lockfile.buffers.resolutions.items);
+                const dep_list = dependencies_lists[current_pkg_id];
+                const res_list = resolutions_lists[current_pkg_id];
+                const deps = dep_list.get(manager.lockfile.buffers.dependencies.items);
+                const pkg_ids = res_list.get(manager.lockfile.buffers.resolutions.items);
 
-                    for (deps, pkg_ids) |dep2, pkg_id| {
-                        if (pkg_id == invalid_package_id) continue;
-                        if (pkg_id >= packages.len) continue;
-                        if (dep2.behavior.dev) continue;
-                        if (visited.contains(pkg_id)) continue;
+                for (deps, pkg_ids) |dep2, pkg_id| {
+                    if (pkg_id == invalid_package_id) continue;
+                    if (pkg_id >= packages.len) continue;
+                    if (dep2.behavior.dev) continue;
+                    if (visited.contains(pkg_id)) continue;
 
-                        try queue.append(manager.allocator, pkg_id);
-                        try visited.put(pkg_id, {});
-                        reachable.set(pkg_id);
-                    }
+                    try queue.append(manager.allocator, pkg_id);
+                    try visited.put(pkg_id, {});
+                    reachable.set(pkg_id);
                 }
             }
         }
@@ -712,12 +717,12 @@ fn updatePackageJSONAndInstallWithManagerWithUpdates(
 
                                     var stack_buf: [64]u8 = undefined;
                                     var heap_allocated = false;
-                                    const lockfile_ver_str = std.fmt.bufPrint(&stack_buf, "{any}", .{lockfile_version.fmt(string_buf)}) catch |err| blk: {
+                                    const lockfile_ver_str = std.fmt.bufPrint(&stack_buf, "{f}", .{lockfile_version.fmt(string_buf)}) catch |err| blk: {
                                         if (err == error.NoSpaceLeft) {
                                             heap_allocated = true;
                                             break :blk std.fmt.allocPrint(
                                                 self.manager.allocator,
-                                                "{any}",
+                                                "{f}",
                                                 .{lockfile_version.fmt(string_buf)},
                                             ) catch continue;
                                         } else {
